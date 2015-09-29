@@ -523,9 +523,9 @@ void LocalStore::tryToDelete(GCState & state, const Path & path)
            now isn't garbage. */
         if (isActiveTempFile(state, path, ".lock")) return;
 
-        /* Don't delete .chroot directories for derivations that are
+        /* Don't delete .sandbox directories for derivations that are
            currently being built. */
-        if (isActiveTempFile(state, path, ".chroot")) return;
+        if (isActiveTempFile(state, path, ".sandbox")) return;
     }
 
     PathSet visited;

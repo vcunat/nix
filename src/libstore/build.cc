@@ -34,7 +34,7 @@
 
 #include <bzlib.h>
 
-/* Includes required for chroot support. */
+/* Includes required for sandbox support. */
 #if HAVE_SYS_PARAM_H
 #include <sys/param.h>
 #endif
@@ -54,22 +54,22 @@
 #include <linux/fs.h>
 #endif
 
-#define CHROOT_ENABLED HAVE_CHROOT && HAVE_SYS_MOUNT_H && defined(MS_BIND) && defined(MS_PRIVATE) && defined(CLONE_NEWNS) && defined(SYS_pivot_root)
-
-/* chroot-like behavior from Apple's sandbox */
+/* sandboxing on Darwin and Linux */
 #if __APPLE__
-    #define SANDBOX_ENABLED 1
+    #define SANDBOX_DARWIN 1
     #define DEFAULT_ALLOWED_IMPURE_PREFIXES "/System/Library /usr/lib /dev /bin/sh"
 #else
-    #define SANDBOX_ENABLED 0
+    #define SANDBOX_DARWIN 0
     #define DEFAULT_ALLOWED_IMPURE_PREFIXES "/bin" "/usr/bin"
 #endif
 
-#if CHROOT_ENABLED
-#include <sys/socket.h>
-#include <sys/ioctl.h>
-#include <net/if.h>
-#include <netinet/ip.h>
+#define SANDBOX_LINUX HAVE_CHROOT && HAVE_SYS_MOUNT_H && defined(MS_BIND) \
+    && defined(MS_PRIVATE) && defined(CLONE_NEWNS) && defined(SYS_pivot_root)
+#if SANDBOX_LINUX
+    #include <sys/socket.h>
+    #include <sys/ioctl.h>
+    #include <net/if.h>
+    #include <netinet/ip.h>
 #endif
 
 #if __linux__
@@ -758,13 +758,13 @@ private:
     /* The build hook. */
     std::shared_ptr<HookInstance> hook;
 
-    /* Whether we're currently doing a chroot build. */
-    bool useChroot = false;
+    /* Whether we're currently doing a sandboxed build. */
+    bool useSandbox = false;
 
-    Path chrootRootDir;
+    Path sandboxRootDir;
 
-    /* RAII object to delete the chroot directory. */
-    std::shared_ptr<AutoDelete> autoDelChroot;
+    /* RAII object to delete the sandbox directory. */
+    std::shared_ptr<AutoDelete> autoDelSandbox;
 
     /* Whether this is a fixed-output derivation. */
     bool fixedOutput;
@@ -773,8 +773,8 @@ private:
     GoalState state;
 
     /* Stuff we need to pass to initChild(). */
-    typedef map<Path, Path> DirsInChroot; // maps target path to source path
-    DirsInChroot dirsInChroot;
+    typedef map<Path, Path> DirsInSandbox; // maps target path to source path
+    DirsInSandbox dirsInSandbox;
     typedef map<string, string> Environment;
     Environment env;
 
@@ -785,7 +785,7 @@ private:
 
     BuildMode buildMode;
 
-    /* If we're repairing without a chroot, there may be outputs that
+    /* If we're repairing without a sandbox, there may be outputs that
        are valid but corrupt.  So we redirect these outputs to
        temporary paths. */
     PathSet redirectedBadOutputs;
@@ -909,7 +909,7 @@ DerivationGoal::DerivationGoal(const Path & drvPath, const BasicDerivation & drv
     name = (format("building of %1%") % showPaths(outputPaths(drv))).str();
     trace("created");
 
-    /* Prevent the .chroot directory from being
+    /* Prevent the .sandbox directory from being
        garbage-collected. (See isActiveTempFile() in gc.cc.) */
     worker.store.addTempRoot(drvPath);
 }
@@ -1484,12 +1484,12 @@ void DerivationGoal::buildDone()
 
             deleteTmpDir(false);
 
-            /* Move paths out of the chroot for easier debugging of
+            /* Move paths out of the sandbox for easier debugging of
                build failures. */
-            if (useChroot && buildMode == bmNormal)
+            if (useSandbox && buildMode == bmNormal)
                 for (auto & i : missingPaths)
-                    if (pathExists(chrootRootDir + i))
-                        rename((chrootRootDir + i).c_str(), i.c_str());
+                    if (pathExists(sandboxRootDir + i))
+                        rename((sandboxRootDir + i).c_str(), i.c_str());
 
             if (diskFull)
                 printMsg(lvlError, "note: build failure may have been caused by lack of free disk space");
@@ -1511,8 +1511,8 @@ void DerivationGoal::buildDone()
         for (auto & i : redirectedOutputs)
             if (pathExists(i.second)) deletePath(i.second);
 
-        /* Delete the chroot (if we were using one). */
-        autoDelChroot.reset(); /* this runs the destructor */
+        /* Delete the sandbox (if we were using one). */
+        autoDelSandbox.reset(); /* this runs the destructor */
 
         deleteTmpDir(true);
 
@@ -1743,7 +1743,7 @@ void DerivationGoal::startBuilder()
     /* Also set TMPDIR and variants to point to this directory. */
     env["TMPDIR"] = env["TEMPDIR"] = env["TMP"] = env["TEMP"] = tmpDir;
 
-    /* Explicitly set PWD to prevent problems with chroot builds.  In
+    /* Explicitly set PWD to prevent problems with sandboxed builds.  In
        particular, dietlibc cannot figure out the cwd because the
        inode of the current directory doesn't appear in .. (because
        getdents returns the inode of the mount point). */
@@ -1836,56 +1836,63 @@ void DerivationGoal::startBuilder()
     }
 
 
-    /* Are we doing a chroot build?  Note that fixed-output
-       derivations are never done in a chroot, mainly so that
+    /* Are we doing a sandboxed build?  Note that fixed-output
+       derivations are never done in a sandbox, mainly so that
        functions like fetchurl (which needs a proper /etc/resolv.conf)
        work properly.  Purity checking for fixed-output derivations
        is somewhat pointless anyway. */
     {
-        string x = settings.get("build-use-chroot", string("false"));
+        string x = settings.get("build-use-sandbox",
+            /* deprecated alias */
+            settings.get("build-use-chroot", string("false")));
         if (x != "true" && x != "false" && x != "relaxed")
-            throw Error("option ‘build-use-chroot’ must be set to one of ‘true’, ‘false’ or ‘relaxed’");
+            throw Error("option ‘build-use-sandbox’ must be set to one of ‘true’, ‘false’ or ‘relaxed’");
         if (x == "true") {
-            if (get(drv->env, "__noChroot") == "1")
-                throw Error(format("derivation ‘%1%’ has ‘__noChroot’ set, but that's not allowed when ‘build-use-chroot’ is ‘true’") % drvPath);
-            useChroot = true;
+            if (get(drv->env, "__noSandbox") == "1")
+                throw Error(format("derivation ‘%1%’ has ‘__noSandbox’ set, but that's not allowed when ‘build-use-sandbox’ is ‘true’") % drvPath);
+            useSandbox = true;
         }
         else if (x == "false")
-            useChroot = false;
+            useSandbox = false;
         else if (x == "relaxed")
-            useChroot = !fixedOutput && get(drv->env, "__noChroot") != "1";
+            useSandbox = !fixedOutput && get(drv->env, "__noSandbox") != "1";
     }
 
-    if (useChroot) {
+    if (useSandbox) {
 
-        string defaultChrootDirs;
-#if CHROOT_ENABLED
+        string defaultSandboxPaths;
+#if SANDBOX_LINUX
         if (isInStore(BASH_PATH))
-            defaultChrootDirs = "/bin/sh=" BASH_PATH;
+            defaultSandboxPaths = "/bin/sh=" BASH_PATH;
 #endif
 
         /* Allow a user-configurable set of directories from the
            host file system. */
-        PathSet dirs = tokenizeString<StringSet>(settings.get("build-chroot-dirs", defaultChrootDirs));
-        PathSet dirs2 = tokenizeString<StringSet>(settings.get("build-extra-chroot-dirs", string("")));
+        PathSet dirs = tokenizeString<StringSet>(
+            settings.get("build-sandbox-paths",
+                /* deprecated alias with lower priority */
+                settings.get("build-chroot-dirs", defaultSandboxPaths)));
+        PathSet dirs2 = tokenizeString<StringSet>(
+            settings.get("build-extra-chroot-dirs",
+                settings.get("build-extra-sandbox-paths", string(""))));
         dirs.insert(dirs2.begin(), dirs2.end());
 
         for (auto & i : dirs) {
             size_t p = i.find('=');
             if (p == string::npos)
-                dirsInChroot[i] = i;
+                dirsInSandbox[i] = i;
             else
-                dirsInChroot[string(i, 0, p)] = string(i, p + 1);
+                dirsInSandbox[string(i, 0, p)] = string(i, p + 1);
         }
-        dirsInChroot[tmpDir] = tmpDir;
+        dirsInSandbox[tmpDir] = tmpDir;
 
-        /* Add the closure of store paths to the chroot. */
+        /* Add the closure of store paths to the sandbox. */
         PathSet closure;
-        for (auto & i : dirsInChroot)
+        for (auto & i : dirsInSandbox)
             if (isInStore(i.second))
                 computeFSClosure(worker.store, toStorePath(i.second), closure);
         for (auto & i : closure)
-            dirsInChroot[i] = i;
+            dirsInSandbox[i] = i;
 
         string allowed = settings.get("allowed-impure-host-deps", string(DEFAULT_ALLOWED_IMPURE_PREFIXES));
         PathSet allowedPaths = tokenizeString<StringSet>(allowed);
@@ -1910,41 +1917,41 @@ void DerivationGoal::startBuilder()
             if (!found)
                 throw Error(format("derivation '%1%' requested impure path ‘%2%’, but it was not in allowed-impure-host-deps (‘%3%’)") % drvPath % i % allowed);
 
-            dirsInChroot[i] = i;
+            dirsInSandbox[i] = i;
         }
 
-#if CHROOT_ENABLED
-        /* Create a temporary directory in which we set up the chroot
+#if SANDBOX_LINUX
+        /* Create a temporary directory in which we set up the sandbox
            environment using bind-mounts.  We put it in the Nix store
            to ensure that we can create hard-links to non-directory
-           inputs in the fake Nix store in the chroot (see below). */
-        chrootRootDir = drvPath + ".chroot";
-        if (pathExists(chrootRootDir)) deletePath(chrootRootDir);
+           inputs in the fake Nix store in the sandbox (see below). */
+        sandboxRootDir = drvPath + ".sandbox";
+        if (pathExists(sandboxRootDir)) deletePath(sandboxRootDir);
 
-        /* Clean up the chroot directory automatically. */
-        autoDelChroot = std::make_shared<AutoDelete>(chrootRootDir);
+        /* Clean up the sandbox directory automatically. */
+        autoDelSandbox = std::make_shared<AutoDelete>(sandboxRootDir);
 
-        printMsg(lvlChatty, format("setting up chroot environment in ‘%1%’") % chrootRootDir);
+        printMsg(lvlChatty, format("setting up sandbox environment in ‘%1%’") % sandboxRootDir);
 
-        if (mkdir(chrootRootDir.c_str(), 0750) == -1)
-            throw SysError(format("cannot create ‘%1%’") % chrootRootDir);
+        if (mkdir(sandboxRootDir.c_str(), 0750) == -1)
+            throw SysError(format("cannot create ‘%1%’") % sandboxRootDir);
 
-        if (chown(chrootRootDir.c_str(), 0, buildUser.getGID()) == -1)
-            throw SysError(format("cannot change ownership of ‘%1%’") % chrootRootDir);
+        if (chown(sandboxRootDir.c_str(), 0, buildUser.getGID()) == -1)
+            throw SysError(format("cannot change ownership of ‘%1%’") % sandboxRootDir);
 
-        /* Create a writable /tmp in the chroot.  Many builders need
+        /* Create a writable /tmp in the sandbox.  Many builders need
            this.  (Of course they should really respect $TMPDIR
            instead.) */
-        Path chrootTmpDir = chrootRootDir + "/tmp";
-        createDirs(chrootTmpDir);
-        chmod_(chrootTmpDir, 01777);
+        Path sandboxTmpDir = sandboxRootDir + "/tmp";
+        createDirs(sandboxTmpDir);
+        chmod_(sandboxTmpDir, 01777);
 
         /* Create a /etc/passwd with entries for the build user and the
            nobody account.  The latter is kind of a hack to support
            Samba-in-QEMU. */
-        createDirs(chrootRootDir + "/etc");
+        createDirs(sandboxRootDir + "/etc");
 
-        writeFile(chrootRootDir + "/etc/passwd",
+        writeFile(sandboxRootDir + "/etc/passwd",
             (format(
                 "nixbld:x:%1%:%2%:Nix build user:/:/noshell\n"
                 "nobody:x:65534:65534:Nobody:/:/noshell\n")
@@ -1953,36 +1960,36 @@ void DerivationGoal::startBuilder()
 
         /* Declare the build user's group so that programs get a consistent
            view of the system (e.g., "id -gn"). */
-        writeFile(chrootRootDir + "/etc/group",
+        writeFile(sandboxRootDir + "/etc/group",
             (format("nixbld:!:%1%:\n")
                 % (buildUser.enabled() ? buildUser.getGID() : getgid())).str());
 
         /* Create /etc/hosts with localhost entry. */
         if (!fixedOutput)
-            writeFile(chrootRootDir + "/etc/hosts", "127.0.0.1 localhost\n");
+            writeFile(sandboxRootDir + "/etc/hosts", "127.0.0.1 localhost\n");
 
-        /* Make the closure of the inputs available in the chroot,
+        /* Make the closure of the inputs available in the sandbox,
            rather than the whole Nix store.  This prevents any access
            to undeclared dependencies.  Directories are bind-mounted,
            while other inputs are hard-linked (since only directories
            can be bind-mounted).  !!! As an extra security
            precaution, make the fake Nix store only writable by the
            build user. */
-        Path chrootStoreDir = chrootRootDir + settings.nixStore;
-        createDirs(chrootStoreDir);
-        chmod_(chrootStoreDir, 01775);
+        Path sandboxStoreDir = sandboxRootDir + settings.nixStore;
+        createDirs(sandboxStoreDir);
+        chmod_(sandboxStoreDir, 01775);
 
-        if (chown(chrootStoreDir.c_str(), 0, buildUser.getGID()) == -1)
-            throw SysError(format("cannot change ownership of ‘%1%’") % chrootStoreDir);
+        if (chown(sandboxStoreDir.c_str(), 0, buildUser.getGID()) == -1)
+            throw SysError(format("cannot change ownership of ‘%1%’") % sandboxStoreDir);
 
         for (auto & i : inputPaths) {
             struct stat st;
             if (lstat(i.c_str(), &st))
                 throw SysError(format("getting attributes of path ‘%1%’") % i);
             if (S_ISDIR(st.st_mode))
-                dirsInChroot[i] = i;
+                dirsInSandbox[i] = i;
             else {
-                Path p = chrootRootDir + i;
+                Path p = sandboxRootDir + i;
                 if (link(i.c_str(), p.c_str()) == -1) {
                     /* Hard-linking fails if we exceed the maximum
                        link count on a file (e.g. 32000 of ext3),
@@ -2000,17 +2007,17 @@ void DerivationGoal::startBuilder()
 
         /* If we're repairing, checking or rebuilding part of a
            multiple-outputs derivation, it's possible that we're
-           rebuilding a path that is in settings.dirsInChroot
+           rebuilding a path that is in settings.dirsInSandbox
            (typically the dependencies of /bin/sh).  Throw them
            out. */
         for (auto & i : drv->outputs)
-            dirsInChroot.erase(i.second.path);
+            dirsInSandbox.erase(i.second.path);
 
-#elif SANDBOX_ENABLED
+#elif SANDBOX_DARWIN
         /* We don't really have any parent prep work to do (yet?)
            All work happens in the child, instead. */
 #else
-        throw Error("chroot builds are not supported on this platform");
+        throw Error("sandboxing builds is not supported on this platform");
 #endif
     }
 
@@ -2019,7 +2026,7 @@ void DerivationGoal::startBuilder()
         if (pathExists(homeDir))
             throw Error(format("directory ‘%1%’ exists; please remove it") % homeDir);
 
-        /* We're not doing a chroot build, but we have some valid
+        /* We're not doing a sandbox build, but we have some valid
            output paths.  Since we can't just overwrite or delete
            them, we have to do hash rewriting: i.e. in the
            environment/arguments passed to the build, we replace the
@@ -2045,11 +2052,11 @@ void DerivationGoal::startBuilder()
     if (settings.preBuildHook != "") {
         printMsg(lvlChatty, format("executing pre-build hook ‘%1%’")
             % settings.preBuildHook);
-        auto args = useChroot ? Strings({drvPath, chrootRootDir}) :
+        auto args = useSandbox ? Strings({drvPath, sandboxRootDir}) :
             Strings({ drvPath });
         enum BuildHookState {
             stBegin,
-            stExtraChrootDirs
+            stExtraSandboxPaths
         };
         auto state = stBegin;
         auto lines = runProgram(settings.preBuildHook, false, args);
@@ -2059,21 +2066,21 @@ void DerivationGoal::startBuilder()
             auto line = std::string{lines, lastPos, nlPos};
             lastPos = nlPos + 1;
             if (state == stBegin) {
-                if (line == "extra-chroot-dirs") {
-                    state = stExtraChrootDirs;
+                if (line == "extra-sandbox-paths" || line == "extra-chroot-dirs") {
+                    state = stExtraSandboxPaths;
                 } else {
                     throw Error(format("unknown pre-build hook command ‘%1%’")
                         % line);
                 }
-            } else if (state == stExtraChrootDirs) {
+            } else if (state == stExtraSandboxPaths) {
                 if (line == "") {
                     state = stBegin;
                 } else {
                     auto p = line.find('=');
                     if (p == string::npos)
-                        dirsInChroot[line] = line;
+                        dirsInSandbox[line] = line;
                     else
-                        dirsInChroot[string(line, 0, p)] = string(line, p + 1);
+                        dirsInSandbox[string(line, 0, p)] = string(line, p + 1);
                 }
             }
         }
@@ -2089,13 +2096,13 @@ void DerivationGoal::startBuilder()
     builderOut.create();
 
     /* Fork a child to build the package. */
-#if CHROOT_ENABLED
-    if (useChroot) {
+#if SANDBOX_LINUX
+    if (useSandbox) {
         /* Set up private namespaces for the build:
 
            - The PID namespace causes the build to start as PID 1.
-             Processes outside of the chroot are not visible to those
-             on the inside, but processes inside the chroot are
+             Processes outside of the sandbox are not visible to those
+             on the inside, but processes inside the sandbox are
              visible from the outside (though with different PIDs).
 
            - The private mount namespace ensures that all the bind
@@ -2188,8 +2195,8 @@ void DerivationGoal::runChild()
 
         commonChildInit(builderOut);
 
-#if CHROOT_ENABLED
-        if (useChroot) {
+#if SANDBOX_LINUX
+        if (useSandbox) {
 
             /* Initialise the loopback interface. */
             AutoCloseFD fd(socket(PF_INET, SOCK_DGRAM, IPPROTO_IP));
@@ -2227,17 +2234,17 @@ void DerivationGoal::runChild()
                     throw SysError(format("unable to make filesystem ‘%1%’ private") % fs);
             }
 
-            /* Bind-mount chroot directory to itself, to treat it as a
+            /* Bind-mount sandbox directory to itself, to treat it as a
                different filesystem from /, as needed for pivot_root. */
-            if (mount(chrootRootDir.c_str(), chrootRootDir.c_str(), 0, MS_BIND, 0) == -1)
-                throw SysError(format("unable to bind mount ‘%1%’") % chrootRootDir);
+            if (mount(sandboxRootDir.c_str(), sandboxRootDir.c_str(), 0, MS_BIND, 0) == -1)
+                throw SysError(format("unable to bind mount ‘%1%’") % sandboxRootDir);
 
             /* Set up a nearly empty /dev, unless the user asked to
                bind-mount the host /dev. */
             Strings ss;
-            if (dirsInChroot.find("/dev") == dirsInChroot.end()) {
-                createDirs(chrootRootDir + "/dev/shm");
-                createDirs(chrootRootDir + "/dev/pts");
+            if (dirsInSandbox.find("/dev") == dirsInSandbox.end()) {
+                createDirs(sandboxRootDir + "/dev/shm");
+                createDirs(sandboxRootDir + "/dev/pts");
                 ss.push_back("/dev/full");
 #ifdef __linux__
                 if (pathExists("/dev/kvm"))
@@ -2248,10 +2255,10 @@ void DerivationGoal::runChild()
                 ss.push_back("/dev/tty");
                 ss.push_back("/dev/urandom");
                 ss.push_back("/dev/zero");
-                createSymlink("/proc/self/fd", chrootRootDir + "/dev/fd");
-                createSymlink("/proc/self/fd/0", chrootRootDir + "/dev/stdin");
-                createSymlink("/proc/self/fd/1", chrootRootDir + "/dev/stdout");
-                createSymlink("/proc/self/fd/2", chrootRootDir + "/dev/stderr");
+                createSymlink("/proc/self/fd", sandboxRootDir + "/dev/fd");
+                createSymlink("/proc/self/fd/0", sandboxRootDir + "/dev/stdin");
+                createSymlink("/proc/self/fd/1", sandboxRootDir + "/dev/stdout");
+                createSymlink("/proc/self/fd/2", sandboxRootDir + "/dev/stderr");
             }
 
             /* Fixed-output derivations typically need to access the
@@ -2264,15 +2271,15 @@ void DerivationGoal::runChild()
                 ss.push_back("/etc/hosts");
             }
 
-            for (auto & i : ss) dirsInChroot[i] = i;
+            for (auto & i : ss) dirsInSandbox[i] = i;
 
             /* Bind-mount all the directories from the "host"
-               filesystem that we want in the chroot
+               filesystem that we want in the sandbox
                environment. */
-            for (auto & i : dirsInChroot) {
+            for (auto & i : dirsInSandbox) {
                 struct stat st;
                 Path source = i.second;
-                Path target = chrootRootDir + i.first;
+                Path target = sandboxRootDir + i.first;
                 if (source == "/proc") continue; // backwards compatibility
                 debug(format("bind mounting ‘%1%’ to ‘%2%’") % source % target);
                 if (stat(source.c_str(), &st) == -1)
@@ -2288,13 +2295,13 @@ void DerivationGoal::runChild()
             }
 
             /* Bind a new instance of procfs on /proc. */
-            createDirs(chrootRootDir + "/proc");
-            if (mount("none", (chrootRootDir + "/proc").c_str(), "proc", 0, 0) == -1)
+            createDirs(sandboxRootDir + "/proc");
+            if (mount("none", (sandboxRootDir + "/proc").c_str(), "proc", 0, 0) == -1)
                 throw SysError("mounting /proc");
 
             /* Mount a new tmpfs on /dev/shm to ensure that whatever
                the builder puts in /dev/shm is cleaned up automatically. */
-            if (pathExists("/dev/shm") && mount("none", (chrootRootDir + "/dev/shm").c_str(), "tmpfs", 0, 0) == -1)
+            if (pathExists("/dev/shm") && mount("none", (sandboxRootDir + "/dev/shm").c_str(), "tmpfs", 0, 0) == -1)
                 throw SysError("mounting /dev/shm");
 
             /* Mount a new devpts on /dev/pts.  Note that this
@@ -2302,32 +2309,32 @@ void DerivationGoal::runChild()
                CONFIG_DEVPTS_MULTIPLE_INSTANCES=y (which is the case
                if /dev/ptx/ptmx exists). */
             if (pathExists("/dev/pts/ptmx") &&
-                !pathExists(chrootRootDir + "/dev/ptmx")
-                && dirsInChroot.find("/dev/pts") == dirsInChroot.end())
+                !pathExists(sandboxRootDir + "/dev/ptmx")
+                && dirsInSandbox.find("/dev/pts") == dirsInSandbox.end())
             {
-                if (mount("none", (chrootRootDir + "/dev/pts").c_str(), "devpts", 0, "newinstance,mode=0620") == -1)
+                if (mount("none", (sandboxRootDir + "/dev/pts").c_str(), "devpts", 0, "newinstance,mode=0620") == -1)
                     throw SysError("mounting /dev/pts");
-                createSymlink("/dev/pts/ptmx", chrootRootDir + "/dev/ptmx");
+                createSymlink("/dev/pts/ptmx", sandboxRootDir + "/dev/ptmx");
 
                 /* Make sure /dev/pts/ptmx is world-writable.  With some
                    Linux versions, it is created with permissions 0.  */
-                chmod_(chrootRootDir + "/dev/pts/ptmx", 0666);
+                chmod_(sandboxRootDir + "/dev/pts/ptmx", 0666);
             }
 
             /* Do the chroot(). */
-            if (chdir(chrootRootDir.c_str()) == -1)
-                throw SysError(format("cannot change directory to ‘%1%’") % chrootRootDir);
+            if (chdir(sandboxRootDir.c_str()) == -1)
+                throw SysError(format("cannot change directory to ‘%1%’") % sandboxRootDir);
 
             if (mkdir("real-root", 0) == -1)
                 throw SysError("cannot create real-root directory");
 
 #define pivot_root(new_root, put_old) (syscall(SYS_pivot_root, new_root, put_old))
             if (pivot_root(".", "real-root") == -1)
-                throw SysError(format("cannot pivot old root directory onto ‘%1%’") % (chrootRootDir + "/real-root"));
+                throw SysError(format("cannot pivot old root directory onto ‘%1%’") % (sandboxRootDir + "/real-root"));
 #undef pivot_root
 
             if (chroot(".") == -1)
-                throw SysError(format("cannot change root directory to ‘%1%’") % chrootRootDir);
+                throw SysError(format("cannot change root directory to ‘%1%’") % sandboxRootDir);
 
             if (umount2("real-root", MNT_DETACH) == -1)
                 throw SysError("cannot unmount real root filesystem");
@@ -2406,14 +2413,14 @@ void DerivationGoal::runChild()
         string sandboxProfile;
         if (isBuiltin(*drv))
             ;
-        else if (useChroot && SANDBOX_ENABLED) {
+        else if (useSandbox && SANDBOX_DARWIN) {
             /* Lots and lots and lots of file functions freak out if they can't stat their full ancestry */
             PathSet ancestry;
 
             /* We build the ancestry before adding all inputPaths to the store because we know they'll
                all have the same parents (the store), and there might be lots of inputs. This isn't
                particularly efficient... I doubt it'll be a bottleneck in practice */
-            for (auto & i : dirsInChroot) {
+            for (auto & i : dirsInSandbox) {
                 Path cur = i.first;
                 while (cur.compare("/") != 0) {
                     cur = dirOf(cur);
@@ -2421,7 +2428,7 @@ void DerivationGoal::runChild()
                 }
             }
 
-            /* And we want the store in there regardless of how empty dirsInChroot. We include the innermost
+            /* And we want the store in there regardless of how empty dirsInSandbox. We include the innermost
                path component this time, since it's typically /nix/store and we care about that. */
             Path cur = settings.nixStore;
             while (cur.compare("/") != 0) {
@@ -2429,9 +2436,9 @@ void DerivationGoal::runChild()
                 cur = dirOf(cur);
             }
 
-            /* Add all our input paths to the chroot */
+            /* Add all our input paths to the sandbox */
             for (auto & i : inputPaths)
-                dirsInChroot[i] = i;
+                dirsInSandbox[i] = i;
 
             /* TODO: we should factor out the policy cleanly, so we don't have to repeat the constants every time... */
             sandboxProfile += "(version 1)\n";
@@ -2487,7 +2494,7 @@ void DerivationGoal::runChild()
                it appears to be a violation of the POSIX spec) that `access` won't do that, and don't deal with it nicely if it does. The most notable of
                these is the entire GHC Haskell ecosystem. */
             sandboxProfile += "(allow file-read* file-write* process-exec\n";
-            for (auto & i : dirsInChroot) {
+            for (auto & i : dirsInSandbox) {
                 if (i.first != i.second)
                     throw SysError(format("can't map '%1%' to '%2%': mismatched impure paths not supported on darwin"));
 
@@ -2599,15 +2606,15 @@ void DerivationGoal::registerOutputs()
         if (missingPaths.find(path) == missingPaths.end()) continue;
 
         Path actualPath = path;
-        if (useChroot) {
-            actualPath = chrootRootDir + path;
+        if (useSandbox) {
+            actualPath = sandboxRootDir + path;
             if (pathExists(actualPath)) {
-                /* Move output paths from the chroot to the Nix store. */
+                /* Move output paths from the sandbox to the Nix store. */
                 if (buildMode == bmRepair)
                     replaceValidPath(path, actualPath);
                 else
                     if (buildMode != bmCheck && rename(actualPath.c_str(), path.c_str()) == -1)
-                        throw SysError(format("moving build output ‘%1%’ from the chroot to the Nix store") % path);
+                        throw SysError(format("moving build output ‘%1%’ from the sandbox to the Nix store") % path);
             }
             if (buildMode != bmCheck) actualPath = path;
         } else {

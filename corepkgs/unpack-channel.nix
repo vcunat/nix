@@ -37,5 +37,5 @@ derivation {
   # No point in doing this remotely.
   preferLocalBuild = true;
 
-  inherit chrootDeps;
+  inherit sandboxDeps;
 }

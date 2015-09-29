@@ -307,7 +307,7 @@ Path EvalState::checkSourcePath(const Path & path_)
     if (isInStore(path)) return path;
 
 #if 0
-    /* Hack to support the chroot dependencies of corepkgs (see
+    /* Hack to support the sandbox dependencies of corepkgs (see
        corepkgs/config.nix.in). */
     if (path == settings.nixPrefix && isStorePath(settings.nixPrefix))
         return path;

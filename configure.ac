@@ -76,7 +76,7 @@ static char buf[1024];]],
 AC_LANG_POP(C++)
 
 
-# Check for chroot support (requires chroot() and bind mounts).
+# Check for sandbox support (requires chroot() and bind mounts).
 AC_CHECK_FUNCS([chroot])
 AC_CHECK_FUNCS([unshare])
 AC_CHECK_FUNCS([statvfs])

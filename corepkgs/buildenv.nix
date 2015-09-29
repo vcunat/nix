@@ -23,5 +23,5 @@ derivation {
   # network traffic, so don't do that.
   preferLocalBuild = true;
 
-  inherit chrootDeps;
+  inherit sandboxDeps;
 }

@@ -17,8 +17,8 @@ in rec {
 
   # If Nix is installed in the Nix store, then automatically add it as
   # a dependency to the core packages. This ensures that they work
-  # properly in a chroot.
-  chrootDeps =
+  # properly in a sandbox.
+  sandboxDeps =
     if dirOf nixPrefix == builtins.storeDir then
       [ (builtins.storePath nixPrefix) ]
     else

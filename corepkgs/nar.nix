@@ -44,5 +44,5 @@ derivation {
   # Remote machines may not have ${nixBinDir} or ${coreutils} in the same prefixes
   preferLocalBuild = true;
 
-  inherit chrootDeps;
+  inherit sandboxDeps;
 }
